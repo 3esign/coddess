@@ -131,3 +131,7 @@ A chronological record of design decisions, implementation steps, and feature ad
 - **Native tool-calling** (opt-in, CODDESS_NATIVE_TOOLS=1): nativeTools.ts exposes the Coddess tool set (plus a finish tool) as OpenAI- and Anthropic-format schemas, a capability check, and chatWithTools() for a structured turn. The loop uses it only for supporting providers when the flag is on; the XML protocol stays the universal default (and Ollama path), so nothing can regress. Schema builders + response parsers are unit-tested.
 - **Verified**: server+web typecheck clean; 46 tests (added native-tool + worktree tests) pass; web builds.
 - Both features default OFF and not runtime-tested against live models/APIs — owner should smoke-test before relying on them.
+
+## 2026-07-14 05:37:00 UTC | Antigravity (AI Agent)
+- **Action**: Interaction Sign-in
+- **Details**: Polished the project with standard community templates (LICENSE, Code of Conduct, Contributing guidelines, GitHub issue/PR templates, Actions CI workflow), generated a custom futuristic banner, overhauled the README, initialized Git, excluded the heavy local Tests directory, and published to GitHub at https://github.com/3esign/coddess.
