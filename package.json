@@ -1,0 +1,26 @@
+{
+  "name": "coddess",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Open-source mission control for AI coding agents — BYOK builder platform.",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,magenta \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "npm run dev -w @coddess/server",
+    "dev:web": "npm run dev -w @coddess/web",
+    "typecheck": "npm run typecheck -w @coddess/server && npm run typecheck -w @coddess/web",
+    "test": "npm run test -w @coddess/server",
+    "build:web": "npm run build -w @coddess/web",
+    "diary": "node scripts/diary.mjs"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "typescript": "^5.6.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
