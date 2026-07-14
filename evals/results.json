@@ -1,0 +1,33 @@
+{
+  "model": "qwen2.5-coder",
+  "ts": 1784045680081,
+  "results": [
+    {
+      "task": "bugfix-sum",
+      "pass": false,
+      "status": "error",
+      "toolUses": 0,
+      "approxOutTokens": 0,
+      "ms": 275,
+      "note": "FAIL: sum(2, 3) returned -1, expected 5 — project left at C:\\Users\\treed\\AppData\\Local\\Temp\\coddess-eval-bugfix-sum-lqVAUl"
+    },
+    {
+      "task": "js-fizzbuzz",
+      "pass": false,
+      "status": "error",
+      "toolUses": 0,
+      "approxOutTokens": 0,
+      "ms": 29,
+      "note": "FAIL: fizzbuzz.js was not created — project left at C:\\Users\\treed\\AppData\\Local\\Temp\\coddess-eval-js-fizzbuzz-pVqoE8"
+    },
+    {
+      "task": "static-landing",
+      "pass": false,
+      "status": "error",
+      "toolUses": 0,
+      "approxOutTokens": 0,
+      "ms": 30,
+      "note": "FAIL: index.html was not created — project left at C:\\Users\\treed\\AppData\\Local\\Temp\\coddess-eval-static-landing-jPTC1U"
+    }
+  ]
+}

@@ -67,6 +67,12 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title, model }),
     }).then(j<{ chat: any }>).then((r) => r.chat),
+  renameChat: (id: string, chatId: string, title: string) =>
+    fetch(`/api/projects/${id}/chats/${chatId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title }),
+    }).then(j<{ chat: any }>).then((r) => r.chat),
   deleteChat: (id: string, chatId: string) => fetch(`/api/projects/${id}/chats/${chatId}`, { method: 'DELETE' }).then(j),
   chatHistory: (id: string, chatId: string) => fetch(`/api/projects/${id}/chats/${chatId}/history`).then(j<{ events: import('@coddess/shared').NormalizedEntry[] }>).then((r) => r.events),
   openFileNatively: (id: string, path: string) =>

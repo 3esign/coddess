@@ -32,27 +32,27 @@ test('detectVerifyCommand ignores the npm default test placeholder', () => {
   assert.equal(detectVerifyCommand(root), null);
 });
 
-test('staticCheck fails when HTML references a missing file', () => {
+test('staticCheck fails when HTML references a missing file', async () => {
   const root = tmp();
   fs.writeFileSync(path.join(root, 'index.html'), '<link href="style.css"><script src="app.js"></script>');
-  const res = staticCheck(root);
+  const res = await staticCheck(root);
   assert.equal(res.ran, true);
   assert.equal(res.ok, false);
   assert.match(res.output, /style\.css/);
 });
 
-test('staticCheck passes when all local references resolve', () => {
+test('staticCheck passes when all local references resolve', async () => {
   const root = tmp();
   fs.writeFileSync(path.join(root, 'style.css'), 'body{}');
   fs.writeFileSync(path.join(root, 'index.html'), '<link href="style.css"><a href="https://x.com">x</a>');
-  const res = staticCheck(root);
+  const res = await staticCheck(root);
   assert.equal(res.ok, true);
 });
 
-test('staticCheck is a no-op when there is nothing to verify', () => {
+test('staticCheck is a no-op when there is nothing to verify', async () => {
   const root = tmp();
   fs.writeFileSync(path.join(root, 'notes.txt'), 'hi');
-  const res = staticCheck(root);
+  const res = await staticCheck(root);
   assert.equal(res.ran, false);
   assert.equal(res.ok, true);
 });

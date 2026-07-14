@@ -43,28 +43,45 @@ export function extractReasoning(text: string): string {
 }
 
 export function parseAction(text: string): ParsedAction {
-  // <final> wins if the model declares it is done.
-  const finalMatch = /<final>([\s\S]*?)<\/final>/i.exec(text);
-  const toolMatch = /<tool\s+name\s*=\s*["']?([a-z_]+)["']?\s*>([\s\S]*?)<\/tool>/i.exec(text);
+  return parseActions(text)[0] || { type: 'none' };
+}
 
-  // If both appear, honour whichever comes first in the stream.
-  if (finalMatch && (!toolMatch || finalMatch.index < toolMatch.index)) {
-    return { type: 'final', summary: finalMatch[1]!.trim() };
-  }
+export function parseActions(text: string): ParsedAction[] {
+  // Pre-process common XML tag fusion typos: </arg name="content"> -> </arg><arg name="content">
+  const cleanedText = text.replace(/<\/arg\s+name\s*=\s*/gi, '</arg><arg name=');
 
-  if (toolMatch) {
-    const tool = toolMatch[1]!.toLowerCase();
-    const inner = toolMatch[2]!;
-    const args: Record<string, string> = {};
-    const argRe = /<arg\s+name\s*=\s*["']?([a-zA-Z_]+)["']?\s*>([\s\S]*?)<\/arg>/gi;
-    let a: RegExpExecArray | null;
-    while ((a = argRe.exec(inner)) !== null) {
-      args[a[1]!] = decodeEntities(stripFence(a[2]!));
+  const actions: ParsedAction[] = [];
+  const regex = /(?:<tool\s+name\s*=\s*["']?([a-z_]+)["']?\s*>([\s\S]*?)(?:<\/tool>|(?=<tool|<final)|$))|(?:<final>([\s\S]*?)(?:<\/final>|(?=<tool|<final)|$))/gi;
+
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(cleanedText)) !== null) {
+    if (match[1]) {
+      const tool = match[1].toLowerCase();
+      const inner = match[2] || '';
+      const args: Record<string, string> = {};
+      const argRe = /<arg\s+name\s*=\s*["']?([a-zA-Z_]+)["']?\s*>([\s\S]*?)<\/arg>/gi;
+      let a: RegExpExecArray | null;
+      let lastIndex = 0;
+      while ((a = argRe.exec(inner)) !== null) {
+        args[a[1]!] = decodeEntities(stripFence(a[2]!));
+        lastIndex = argRe.lastIndex;
+      }
+      // Tolerate trailing unclosed arg
+      const tail = /<arg\s+name\s*=\s*["']?([a-zA-Z_]+)["']?\s*>([\s\S]*)$/i.exec(inner.slice(lastIndex));
+      if (tail && !(tail[1]! in args)) {
+        const val = tail[2]!.replace(/<\/tool>[\s\S]*$/i, '');
+        args[tail[1]!] = decodeEntities(stripFence(val));
+      }
+      actions.push({ type: 'tool', tool, args });
+    } else if (match[3] !== undefined) {
+      actions.push({ type: 'final', summary: match[3].trim() });
     }
-    return { type: 'tool', tool, args };
   }
 
-  return { type: 'none' };
+  if (actions.length === 0) {
+    return [{ type: 'none' }];
+  }
+  return actions;
 }
 
 /** Strip a single wrapping ``` code fence if the model added one inside an arg. */

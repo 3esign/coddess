@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ChatMessage } from './provider/providerRouter.js';
-import { messagesTokens, needsCompaction, splitForCompaction, assembleCompacted, compactIfNeeded } from './compaction.js';
+import { messagesTokens, needsCompaction, splitForCompaction, assembleCompacted, compactIfNeeded, maskObservations } from './compaction.js';
 
 function msgs(n: number): ChatMessage[] {
   const out: ChatMessage[] = [{ role: 'system', content: 'SYS' }];
@@ -51,3 +51,43 @@ test('compactIfNeeded is a no-op below threshold (no model call)', async () => {
   assert.equal(r.compacted, false);
   assert.equal(r.messages, m);
 });
+
+test('maskObservations hides large outputs and leaves short ones alone', () => {
+  const short = '<observation tool="read_file" ok="true">short content</observation>';
+  const long = `<observation tool="read_file" ok="true">${'x'.repeat(200)}</observation>`;
+  
+  assert.equal(maskObservations(short), short);
+  assert.match(maskObservations(long), /Output masked/);
+  assert.match(maskObservations(long), /200 chars/);
+});
+
+test('maskObservations is idempotent', () => {
+  const long = `<observation tool="read_file" ok="true">${'x'.repeat(200)}</observation>`;
+  const first = maskObservations(long);
+  const second = maskObservations(first);
+  assert.equal(first, second);
+});
+
+test('compactIfNeeded uses masking to avoid LLM call if it brings size below threshold', async () => {
+  // We construct history that exceeds a small threshold
+  const m: ChatMessage[] = [
+    { role: 'system', content: 'SYS' },
+    { role: 'user', content: `<observation tool="read_file" ok="true">${'x'.repeat(500)}</observation>` },
+    { role: 'assistant', content: 'thinking' },
+    { role: 'user', content: 'recent verbatim message' },
+  ];
+  
+  // Set threshold such that original size (SYS + 500 chars + thinking + recent) is above,
+  // but masked size (SYS + ~60 chars masked text + thinking + recent) is below.
+  const r = await compactIfNeeded(m, 'nonexistent-model', 80, 2);
+  assert.equal(r.compacted, true);
+  assert.match(r.noteText || '', /masked/);
+  
+  // The first user message should be masked
+  assert.match(r.messages[1]!.content, /Output masked/);
+  assert.match(r.messages[1]!.content, /500 chars/);
+  // The system and recent message should remain verbatim
+  assert.equal(r.messages[0]!.content, 'SYS');
+  assert.equal(r.messages[3]!.content, 'recent verbatim message');
+});
+

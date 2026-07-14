@@ -1,9 +1,24 @@
-import { OLLAMA_HOST } from '../../config.js';
+import { OLLAMA_HOST, NUM_CTX } from '../../config.js';
 import { getSettings } from '../../settings.js';
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
+}
+
+/**
+ * Per-call generation options. All optional and backward-compatible:
+ *  - stop:   stop sequences (e.g. ["</tool>","</final>"]) so the model can't run
+ *            past its single action, emit a second action, or hallucinate results.
+ *  - format: Ollama structured-output constraint ('json' or a JSON Schema object)
+ *            for the JSON stages (intent/plan/knowledge) — a hard well-formedness
+ *            guarantee on weak local models. Ignored by hosted providers here.
+ *  - numCtx: override the Ollama context window (defaults to config NUM_CTX).
+ */
+export interface ChatOptions {
+  stop?: string[];
+  format?: unknown;
+  numCtx?: number;
 }
 
 export class ProviderError extends Error {}
@@ -16,6 +31,7 @@ export async function* chatStream(
   model: string,
   messages: ChatMessage[],
   signal?: AbortSignal,
+  opts: ChatOptions = {},
 ): AsyncGenerator<string> {
   const settings = getSettings();
 
@@ -31,9 +47,10 @@ export async function* chatStream(
       messages,
       signal,
       {
-        'HTTP-Referer': 'https://github.com/oscode/oscode',
-        'X-Title': 'OSCode',
-      }
+        'HTTP-Referer': 'https://github.com/coddess/coddess',
+        'X-Title': 'Coddess',
+      },
+      opts,
     );
     return;
   }
@@ -43,7 +60,7 @@ export async function* chatStream(
     const realModel = model.startsWith('anthropic/') ? model.replace('anthropic/', '') : model;
     const apiKey = settings.apiKeys.anthropic;
     if (!apiKey) throw new ProviderError('Anthropic API key is not configured.');
-    yield* streamAnthropic(apiKey, realModel, messages, signal);
+    yield* streamAnthropic(apiKey, realModel, messages, signal, opts);
     return;
   }
 
@@ -58,7 +75,9 @@ export async function* chatStream(
       apiKey,
       realModel,
       messages,
-      signal
+      signal,
+      {},
+      opts,
     );
     return;
   }
@@ -73,7 +92,9 @@ export async function* chatStream(
       apiKey,
       realModel,
       messages,
-      signal
+      signal,
+      {},
+      opts,
     );
     return;
   }
@@ -88,7 +109,9 @@ export async function* chatStream(
       apiKey,
       realModel,
       messages,
-      signal
+      signal,
+      {},
+      opts,
     );
     return;
   }
@@ -106,13 +129,15 @@ export async function* chatStream(
       provider.apiKey || '',
       realModel,
       messages,
-      signal
+      signal,
+      {},
+      opts,
     );
     return;
   }
 
   // 7. Fallback to local Ollama
-  yield* streamOllama(model, messages, signal);
+  yield* streamOllama(model, messages, signal, opts);
 }
 
 /** Stream Ollama native chat endpoint */
@@ -120,18 +145,25 @@ async function* streamOllama(
   model: string,
   messages: ChatMessage[],
   signal?: AbortSignal,
+  opts: ChatOptions = {},
 ): AsyncGenerator<string> {
+  const options: Record<string, unknown> = {
+    temperature: 0.2,
+    // Without num_ctx Ollama silently truncates to its small default (~4K),
+    // cutting the system prompt + history. Request the real window explicitly.
+    num_ctx: opts.numCtx ?? NUM_CTX,
+  };
+  if (opts.stop && opts.stop.length) options.stop = opts.stop;
+
+  const body: Record<string, unknown> = { model, messages, stream: true, options };
+  if (opts.format !== undefined) body.format = opts.format;
+
   let res: Response;
   try {
     res = await fetch(`${OLLAMA_HOST}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model,
-        messages,
-        stream: true,
-        options: { temperature: 0.2 },
-      }),
+      body: JSON.stringify(body),
       signal,
     });
   } catch (err) {
@@ -141,11 +173,11 @@ async function* streamOllama(
   }
 
   if (!res.ok) {
-    const body = await res.text().catch(() => '');
+    const errBody = await res.text().catch(() => '');
     if (res.status === 404) {
       throw new ProviderError(`Model "${model}" not found in Ollama. Pull it first: "ollama pull ${model}".`);
     }
-    throw new ProviderError(`Ollama error ${res.status}: ${body}`);
+    throw new ProviderError(`Ollama error ${res.status}: ${errBody}`);
   }
   if (!res.body) throw new ProviderError('Ollama returned an empty response body.');
 
@@ -180,7 +212,8 @@ async function* streamOpenAICompatible(
   model: string,
   messages: ChatMessage[],
   signal?: AbortSignal,
-  extraHeaders: Record<string, string> = {}
+  extraHeaders: Record<string, string> = {},
+  opts: ChatOptions = {},
 ): AsyncGenerator<string> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
@@ -190,17 +223,20 @@ async function* streamOpenAICompatible(
     headers['Authorization'] = `Bearer ${apiKey}`;
   }
 
+  const body: Record<string, unknown> = {
+    model,
+    messages,
+    stream: true,
+    temperature: 0.2,
+  };
+  if (opts.stop && opts.stop.length) body.stop = opts.stop;
+
   let res: Response;
   try {
     res = await fetch(url, {
       method: 'POST',
       headers,
-      body: JSON.stringify({
-        model,
-        messages,
-        stream: true,
-        temperature: 0.2,
-      }),
+      body: JSON.stringify(body),
       signal,
     });
   } catch (err) {
@@ -208,8 +244,8 @@ async function* streamOpenAICompatible(
   }
 
   if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new ProviderError(`API error ${res.status} from ${url}: ${body}`);
+    const errBody = await res.text().catch(() => '');
+    throw new ProviderError(`API error ${res.status} from ${url}: ${errBody}`);
   }
   if (!res.body) throw new ProviderError('API returned an empty response body.');
 
@@ -247,6 +283,7 @@ async function* streamAnthropic(
   model: string,
   messages: ChatMessage[],
   signal?: AbortSignal,
+  opts: ChatOptions = {},
 ): AsyncGenerator<string> {
   const systemMessage = messages.find(m => m.role === 'system');
   const system = systemMessage ? systemMessage.content : '';
@@ -257,6 +294,15 @@ async function* streamAnthropic(
       content: m.content,
     }));
 
+  const body: Record<string, unknown> = {
+    model,
+    messages: anthropicMessages,
+    system: system || undefined,
+    max_tokens: 4000,
+    stream: true,
+  };
+  if (opts.stop && opts.stop.length) body.stop_sequences = opts.stop;
+
   let res: Response;
   try {
     res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -266,13 +312,7 @@ async function* streamAnthropic(
         'x-api-key': apiKey,
         'anthropic-version': '2023-06-01',
       },
-      body: JSON.stringify({
-        model,
-        messages: anthropicMessages,
-        system: system || undefined,
-        max_tokens: 4000,
-        stream: true,
-      }),
+      body: JSON.stringify(body),
       signal,
     });
   } catch (err) {
@@ -280,8 +320,8 @@ async function* streamAnthropic(
   }
 
   if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new ProviderError(`Anthropic API error ${res.status}: ${body}`);
+    const errBody = await res.text().catch(() => '');
+    throw new ProviderError(`Anthropic API error ${res.status}: ${errBody}`);
   }
   if (!res.body) throw new ProviderError('Anthropic returned an empty response body.');
 

@@ -3,19 +3,21 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { nanoid } from 'nanoid';
 import type { NormalizedEntry, Project, Spec, RunStatus } from '@coddess/shared';
-import { ALLOW_SHELL, DEFAULT_MODEL, ENABLE_INTENT, ENABLE_VERIFY, MAX_REPAIRS, ENABLE_KNOWLEDGE, ENABLE_COMPACTION, COMPACT_AT, COMPACT_KEEP_RECENT, NATIVE_TOOLS } from '../config.js';
+import { ALLOW_SHELL, DEFAULT_MODEL, ENABLE_INTENT, ENABLE_VERIFY, MAX_REPAIRS, ENABLE_KNOWLEDGE, ENABLE_COMPACTION, COMPACT_AT, COMPACT_KEEP_RECENT, NATIVE_TOOLS, MAX_STEPS, ENABLE_REPOMAP, REPOMAP_TOKENS, REPOMAP_MIN_FILES, ENABLE_REVIEW, MAX_REVIEW, ENABLE_BATCH_READS, STREAM_IDLE_MS, MAX_EMPTY_RESPONSES } from '../config.js';
 import { buildTree } from '../fsutil.js';
 import { buildSystemPrompt } from './systemPrompt.js';
-import { parseAction, extractReasoning, type ParsedAction } from './protocol.js';
+import { parseAction, parseActions, extractReasoning, type ParsedAction, type ToolAction } from './protocol.js';
 import { runTool } from './tools.js';
 import { runVerification } from './verify.js';
 import { chatStream, ProviderError, type ChatMessage } from './provider/providerRouter.js';
 import { Budget, countTokens } from './budget.js';
 import { runCritique } from './observer.js';
 import { scaffoldFor, type ScaffoldProfile } from './modelProfile.js';
-import { compileIntent, specToPromptBlock } from './intent.js';
+import { compileIntent, specToPromptBlock, specToPlanFile } from './intent.js';
+import { repoMapPromptBlock } from './repoMap.js';
+import { reviewAgainstCriteria } from './review.js';
 import { knowledgePromptBlock, updateKnowledgeFromRun } from './knowledge.js';
-import { drainInjections } from './injections.js';
+import { drainInjections, enqueueInjection } from './injections.js';
 import { compactIfNeeded } from './compaction.js';
 import { chatWithTools, providerSupportsNativeTools } from './nativeTools.js';
 import {
@@ -24,6 +26,7 @@ import {
   readMessages,
   writeMessages,
   appendHistory,
+  readHistory,
   updateChatMeta,
   isPausedContinuation,
   otherChatsTokens,
@@ -36,6 +39,7 @@ export interface RunHandle {
   runId: string;
   cancel: () => void;
   pause: () => void;
+  inject?: (text: string) => void;
 }
 
 export interface ActiveRunInfo {
@@ -68,7 +72,24 @@ export function startRun(
   const model = modelOverride || project.model || DEFAULT_MODEL;
   let pauseRequested = false;
 
-  void runAgent(project, prompt, model, runId, chatId, { maxTokens, projectMaxTokens }, controller.signal, () => pauseRequested, emit).catch(
+  let currentStepAbort: AbortController | null = null;
+  let onInjectInterrupt: (() => void) | null = null;
+
+  void runAgent(
+    project,
+    prompt,
+    model,
+    runId,
+    chatId,
+    { maxTokens, projectMaxTokens },
+    controller.signal,
+    () => pauseRequested,
+    emit,
+    (stepAbort, onInterrupt) => {
+      currentStepAbort = stepAbort;
+      onInjectInterrupt = onInterrupt;
+    }
+  ).catch(
     (err) => {
       emit({ kind: 'error', runId, projectId: project.id, ts: Date.now(), message: (err as Error).message, chatId });
       emit({ kind: 'status', runId, projectId: project.id, ts: Date.now(), status: 'error', chatId });
@@ -82,6 +103,20 @@ export function startRun(
       pauseRequested = true;
       controller.abort();
     },
+    inject: (text: string) => {
+      emit({ kind: 'user_prompt', runId, projectId: project.id, chatId, ts: Date.now(), text });
+      
+      const paths = chatPaths(project, chatId);
+      ensureChatDir(paths);
+      appendHistory(paths, { kind: 'user_prompt', runId, projectId: project.id, chatId, ts: Date.now(), text });
+
+      enqueueInjection(project.id, chatId, text);
+
+      if (currentStepAbort) {
+        onInjectInterrupt?.();
+        currentStepAbort.abort();
+      }
+    }
   };
 }
 
@@ -100,6 +135,7 @@ export async function runAgent(
   signal: AbortSignal,
   isPauseRequested: () => boolean,
   emit: Emit,
+  onStepUpdate?: (stepAbort: AbortController | null, onInterrupt: () => void) => void,
 ): Promise<RunStatus> {
   activeRuns.set(runId, { projectId: project.id, chatId, model, runId });
   const base = { runId, projectId: project.id, chatId };
@@ -151,13 +187,27 @@ export async function runAgent(
         persistMeta(status);
         return status;
       }
+    } else {
+      try {
+        const history = readHistory(paths);
+        const lastSpecEntry = [...history].reverse().find((item) => item.kind === 'spec') as any;
+        if (lastSpecEntry && lastSpecEntry.spec) {
+          spec = lastSpecEntry.spec;
+        }
+      } catch {
+        /* ignore */
+      }
     }
     const specBlock = spec ? specToPromptBlock(spec) : undefined;
+    // Seed PLAN.md from the approved plan so the run starts against a real checklist
+    // (skipped for orchestrated subtasks and paused continuations, which reuse it).
+    if (spec && !isContinuation && !opts.skipIntent) seedPlanFile(project.path, spec);
     const knowledgeBlock = ENABLE_KNOWLEDGE ? knowledgePromptBlock(project) : undefined;
     const contextDirs = project.contextDirs || [];
     const contextBlock = buildContextBlock(contextDirs);
+    const repoMapBlock = ENABLE_REPOMAP ? repoMapPromptBlock(project.path, REPOMAP_TOKENS, REPOMAP_MIN_FILES, repoHints(prompt, spec)) : undefined;
 
-    const system = buildRunSystemPrompt(project, chatId, tree, specBlock, knowledgeBlock, contextBlock, profile, budget.remaining());
+    const system = buildRunSystemPrompt(project, chatId, tree, specBlock, knowledgeBlock, contextBlock, repoMapBlock, profile, budget.remaining());
     budget.add(system);
     messages.unshift({ role: 'system', content: system });
     messages.push({ role: 'user', content: formattedPrompt });
@@ -166,8 +216,13 @@ export async function runAgent(
     if (spec) emitAndSave({ kind: 'spec', ...base, ts: Date.now(), spec });
 
     let repairRounds = 0;
+    let reviewRounds = 0;
+    let lastTool: string | null = null;
+    let lastArgsKey: string | null = null;
+    let consecutiveSameCount = 0;
+    let consecutiveNone = 0;
 
-    for (let step = 0; ; step++) {
+    for (let step = 0; step < MAX_STEPS; step++) {
       if (signal.aborted) {
         const status: RunStatus = isPauseRequested() ? 'paused' : 'cancelled';
         emitAndSave({ kind: 'status', ...base, ts: Date.now(), status });
@@ -178,7 +233,6 @@ export async function runAgent(
       // Drain any messages the user queued mid-run; inject them as context.
       const injected = drainInjections(project.id, chatId);
       for (const text of injected) {
-        emitAndSave({ kind: 'user_prompt', ...base, ts: Date.now(), text });
         const m = '[USER MESSAGE - sent while you were working. Read it, reason about how it changes what you are doing, adjust your plan if needed, then continue.]' + '\n<user_message>\n' + text + '\n</user_message>';
         messages.push({ role: 'user', content: m });
         budget.add(m);
@@ -191,16 +245,39 @@ export async function runAgent(
         if (c.compacted) {
           messages = c.messages;
           saveMessages();
-          emitAndSave({ kind: 'assistant_message', ...base, ts: Date.now(), text: 'Context compacted: older turns were summarized to fit the model window.' });
+          emitAndSave({ kind: 'assistant_message', ...base, ts: Date.now(), text: c.noteText || 'Context compacted: older turns were summarized to fit the model window.' });
         }
       }
 
       let full = '';
       let nativeAction: ParsedAction | null = null;
       const useNative = NATIVE_TOOLS && providerSupportsNativeTools(model);
+
+      // Stall watchdog: forward the external abort to an internal controller and
+      // additionally abort it if the model goes silent for STREAM_IDLE_MS. This is
+      // the signal actually handed to the provider, so a hung stream can no longer
+      // leave the run wedged with the UI stuck in a "running" state.
+      let stalled = false;
+      const streamAbort = new AbortController();
+      let interruptedByInjection = false;
+      const onInterrupt = () => { interruptedByInjection = true; };
+      onStepUpdate?.(streamAbort, onInterrupt);
+      const forwardAbort = () => streamAbort.abort();
+      let idleTimer: ReturnType<typeof setTimeout> | null = null;
+      const clearIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
+      const armIdle = () => {
+        if (!STREAM_IDLE_MS) return;
+        clearIdle();
+        idleTimer = setTimeout(() => { stalled = true; streamAbort.abort(); }, STREAM_IDLE_MS);
+      };
+      if (signal.aborted) streamAbort.abort();
+      else signal.addEventListener('abort', forwardAbort, { once: true });
+
       try {
+        armIdle();
         if (useNative) {
-          const turn = await chatWithTools(model, messages, signal);
+          const turn = await chatWithTools(model, messages, streamAbort.signal);
+          clearIdle();
           full = turn.text || '';
           if (full) emitAndSave({ kind: 'assistant_token', ...base, ts: Date.now(), text: full });
           budget.add(full, true);
@@ -211,14 +288,40 @@ export async function runAgent(
               : { type: 'tool', tool: turn.call.name, args: stringifyArgs(turn.call.args) };
           }
         } else {
-          for await (const chunk of chatStream(model, messages, signal)) {
+          for await (const chunk of chatStream(model, messages, streamAbort.signal)) {
+            armIdle(); // progress: reset the stall timer on every chunk
             full += chunk;
             emitAndSave({ kind: 'assistant_token', ...base, ts: Date.now(), text: chunk });
             budget.add(chunk, true);
             budget.enforce();
           }
+          clearIdle();
         }
       } catch (err) {
+        clearIdle();
+        signal.removeEventListener('abort', forwardAbort);
+        onStepUpdate?.(null, () => {});
+
+        if (interruptedByInjection) {
+          if (full.trim()) {
+            messages.push({ role: 'assistant', content: full });
+            saveMessages();
+            const reasoning = extractReasoning(full);
+            if (reasoning) emitAndSave({ kind: 'thinking', ...base, ts: Date.now(), text: reasoning });
+          }
+          continue;
+        }
+        // Model went silent (not a user abort): end the run with a clear error
+        // rather than hanging. streamAbort fired but the external signal did not.
+        if (stalled && !signal.aborted) {
+          const secs = Math.round(STREAM_IDLE_MS / 1000);
+          const stallMsg = `The model produced no output for ${secs}s and appears to have stalled. This is usually an Ollama context overflow or an overloaded local model. Run stopped. Try a smaller task, a larger num_ctx, or a lighter model.`;
+          emitAndSave({ kind: 'error', ...base, ts: Date.now(), message: stallMsg });
+          emitAndSave({ kind: 'status', ...base, ts: Date.now(), status: 'error' });
+          writeStatusFileSafe(project.path, stallMsg);
+          persistMeta('error');
+          return 'error';
+        }
         if (signal.aborted) {
           if (isPauseRequested()) {
             if (full.trim()) {
@@ -242,6 +345,8 @@ export async function runAgent(
         persistMeta('error');
         return 'error';
       }
+      onStepUpdate?.(null, () => {});
+      signal.removeEventListener('abort', forwardAbort);
 
       messages.push({ role: 'assistant', content: full });
       saveMessages();
@@ -249,9 +354,37 @@ export async function runAgent(
       const reasoning = extractReasoning(full);
       if (reasoning) emitAndSave({ kind: 'thinking', ...base, ts: Date.now(), text: reasoning });
 
-      const action = nativeAction ?? parseAction(full);
+      const actions = nativeAction ? [nativeAction] : parseActions(full);
+      const firstAction = actions[0] || { type: 'none' };
+      const action = firstAction;
+
+      if (action.type === 'tool') {
+        const argsKey = `${action.tool}:${JSON.stringify(action.args)}`;
+        if (action.tool === lastTool && argsKey === lastArgsKey) {
+          consecutiveSameCount++;
+        } else {
+          consecutiveSameCount = 1;
+          lastTool = action.tool;
+          lastArgsKey = argsKey;
+        }
+      } else {
+        consecutiveSameCount = 0;
+        lastTool = null;
+        lastArgsKey = null;
+      }
+
+      // Hard loop-breaker: if the model repeats the exact same action with no new
+      // result, stop instead of burning the whole budget on a stuck loop.
+      if (action.type === 'tool' && consecutiveSameCount >= 6) {
+        emitAndSave({ kind: 'assistant_message', ...base, ts: Date.now(), text: `Aborting: the same action (${action.tool}) was repeated ${consecutiveSameCount} times with no new result.` });
+        writeStatusFileSafe(project.path, `Stuck repeating ${action.tool}; aborted to avoid an infinite loop.`);
+        emitAndSave({ kind: 'status', ...base, ts: Date.now(), status: 'error' });
+        persistMeta('error');
+        return 'error';
+      }
 
       if (action.type === 'final') {
+        consecutiveNone = 0;
         // --- Pipeline Stage 3: verify -> repair (bounded) ---
         if (ENABLE_VERIFY && repairRounds < MAX_REPAIRS && !signal.aborted) {
           const v = await runVerification(project.path);
@@ -267,6 +400,22 @@ export async function runAgent(
             continue;
           }
         }
+
+        // --- Pipeline Stage 3b: acceptance-criteria review gate (fresh-context judge) ---
+        if (ENABLE_REVIEW && spec && spec.acceptanceCriteria.length && reviewRounds < MAX_REVIEW && !signal.aborted) {
+          const rev = await reviewAgainstCriteria(project, spec, model, signal);
+          if (rev.ran) {
+            emitAndSave({ kind: 'review', ...base, ts: Date.now(), ok: rev.pass, met: rev.met, total: rev.total, output: rev.output, round: reviewRounds + 1 });
+          }
+          if (rev.ran && !rev.pass) {
+            reviewRounds++;
+            const reviewMsg = `Acceptance review FAILED (attempt ${reviewRounds}/${MAX_REVIEW}) — ${rev.met}/${rev.total} criteria met.\nUnmet criteria:\n${rev.unmet.map((u) => `- ${u.criterion} — ${u.reason}`).join('\n')}\n\nImplement the missing behavior, then continue. Do NOT call <final> until every acceptance criterion is satisfied.`;
+            messages.push({ role: 'user', content: reviewMsg });
+            budget.add(reviewMsg);
+            saveMessages();
+            continue;
+          }
+        }
         emitAndSave({ kind: 'final', ...base, ts: Date.now(), summary: action.summary });
         emitAndSave({ kind: 'status', ...base, ts: Date.now(), status: 'done' });
         persistMeta('done');
@@ -276,8 +425,19 @@ export async function runAgent(
       }
 
       if (action.type === 'none') {
+        consecutiveNone++;
         const surfaced = stripTags(full).trim();
         if (surfaced) emitAndSave({ kind: 'assistant_message', ...base, ts: Date.now(), text: surfaced });
+        // Repeated empty/actionless turns usually mean the context window is blown
+        // or the model is confused. Stop rather than burn the whole step budget.
+        if (consecutiveNone >= MAX_EMPTY_RESPONSES) {
+          const emptyMsg = `The model returned no runnable action ${consecutiveNone} times in a row and made no progress. Stopping. This often means the context window overflowed — try a smaller task, a larger num_ctx, or a more capable model.`;
+          emitAndSave({ kind: 'assistant_message', ...base, ts: Date.now(), text: emptyMsg });
+          writeStatusFileSafe(project.path, emptyMsg);
+          emitAndSave({ kind: 'status', ...base, ts: Date.now(), status: 'error' });
+          persistMeta('error');
+          return 'error';
+        }
         messages.push({
           role: 'user',
           content:
@@ -286,20 +446,69 @@ export async function runAgent(
         saveMessages();
         continue;
       }
+      consecutiveNone = 0;
 
-      emitAndSave({ kind: 'tool_use', ...base, ts: Date.now(), tool: action.tool, args: action.args });
-      const result = await runTool(project.path, action.tool, action.args, contextDirs);
-      emitAndSave({ kind: 'tool_result', ...base, ts: Date.now(), tool: action.tool, ok: result.ok, output: result.output });
+      // Check for batch execution of read-only tools
+      const isReadOnlyTool = (act: ParsedAction) =>
+        act.type === 'tool' && ['list_dir', 'read_file', 'search_code'].includes(act.tool);
+      const allReadOnly = actions.every(isReadOnlyTool);
+      const batchEnabled = ENABLE_BATCH_READS && profile.allowBatchReads;
 
-      const remaining = budget.remaining();
-      const budgetInfo =
-        remaining !== undefined
-          ? `\n\n[Budget Check: Remaining session budget is ${remaining} tokens. If you are close to running out, make sure to write CODDESS_STATUS.md and call <final>.]`
+      if (actions.length > 1 && allReadOnly && batchEnabled) {
+        const toolActions = actions as ToolAction[];
+        
+        for (const act of toolActions) {
+          emitAndSave({ kind: 'tool_use', ...base, ts: Date.now(), tool: act.tool, args: act.args });
+        }
+
+        const results = await Promise.all(
+          toolActions.map((act) => runTool(project.path, act.tool, act.args, contextDirs))
+        );
+
+        for (let i = 0; i < toolActions.length; i++) {
+          const act = toolActions[i]!;
+          const res = results[i]!;
+          emitAndSave({ kind: 'tool_result', ...base, ts: Date.now(), tool: act.tool, ok: res.ok, output: res.output });
+        }
+
+        let observation = '';
+        for (let i = 0; i < toolActions.length; i++) {
+          const act = toolActions[i]!;
+          const res = results[i]!;
+          observation += `<observation tool="${act.tool}" ok="${res.ok}">\n${res.output}\n</observation>\n\n`;
+        }
+
+        const planProgress = getPlanProgress(project.path);
+        const remaining = budget.remaining();
+        const budgetInfo =
+          remaining !== undefined
+            ? `\n\n[Budget Check: Remaining session budget is ${remaining} tokens. If you are close to running out, make sure to write CODDESS_STATUS.md and call <final>.]`
+            : '';
+
+        observation += `Continue with your next action(s).${planProgress}${budgetInfo}`;
+        messages.push({ role: 'user', content: observation });
+        budget.add(observation);
+        saveMessages();
+      } else {
+        // Run single action
+        emitAndSave({ kind: 'tool_use', ...base, ts: Date.now(), tool: action.tool, args: action.args });
+        const result = await runTool(project.path, action.tool, action.args, contextDirs);
+        emitAndSave({ kind: 'tool_result', ...base, ts: Date.now(), tool: action.tool, ok: result.ok, output: result.output });
+
+        const loopWarning = consecutiveSameCount >= 3
+          ? `\n\n[WARNING]: You have executed the same action (${action.tool}) ${consecutiveSameCount} times consecutively with the same arguments. If it is failing or not producing new results, please check your assumptions, examine other files, or change your implementation approach. Do not repeat the same action endlessly.`
           : '';
-      const observation = `<observation tool="${action.tool}" ok="${result.ok}">\n${result.output}\n</observation>\n\nContinue with your next single action.${budgetInfo}`;
-      messages.push({ role: 'user', content: observation });
-      budget.add(observation);
-      saveMessages();
+        const planProgress = getPlanProgress(project.path);
+        const remaining = budget.remaining();
+        const budgetInfo =
+          remaining !== undefined
+            ? `\n\n[Budget Check: Remaining session budget is ${remaining} tokens. If you are close to running out, make sure to write CODDESS_STATUS.md and call <final>.]`
+            : '';
+        const observation = `<observation tool="${action.tool}" ok="${result.ok}">\n${result.output}\n</observation>\n\nContinue with your next single action.${loopWarning}${planProgress}${budgetInfo}`;
+        messages.push({ role: 'user', content: observation });
+        budget.add(observation);
+        saveMessages();
+      }
 
       if (isPauseRequested()) {
         emitAndSave({ kind: 'status', ...base, ts: Date.now(), status: 'paused' });
@@ -309,7 +518,12 @@ export async function runAgent(
       }
     }
 
-
+    // Step budget exhausted without a <final> — stop cleanly rather than loop forever.
+    emitAndSave({ kind: 'assistant_message', ...base, ts: Date.now(), text: `Step limit reached (${MAX_STEPS} steps) before the task reported done. Stopping to avoid an unbounded loop; see PLAN.md / CODDESS_STATUS.md for what remains.` });
+    writeStatusFileSafe(project.path, `Step limit (${MAX_STEPS}) reached before completion. See PLAN.md for remaining steps.`);
+    emitAndSave({ kind: 'status', ...base, ts: Date.now(), status: 'error' });
+    persistMeta('error');
+    return 'error';
   } finally {
     activeRuns.delete(runId);
   }
@@ -323,6 +537,7 @@ function buildRunSystemPrompt(
   specBlock: string | undefined,
   knowledgeBlock: string | undefined,
   contextBlock: string | undefined,
+  repoMapBlock: string | undefined,
   profile: ScaffoldProfile,
   remainingTokens: number | undefined,
 ): string {
@@ -336,9 +551,11 @@ function buildRunSystemPrompt(
     specBlock,
     knowledgeBlock,
     contextBlock,
+    repoMapBlock,
     tier: profile.tier,
     requireStructuredThinking: profile.requireStructuredThinking,
     smallSteps: profile.smallSteps,
+    allowBatchReads: profile.allowBatchReads,
   });
 
   const concurrent = Array.from(activeRuns.values()).filter((r) => r.projectId === project.id && r.chatId !== chatId);
@@ -375,6 +592,21 @@ function buildContextBlock(contextDirs: string[]): string | undefined {
   return parts.join('\n');
 }
 
+/** Words from the prompt + spec used to boost relevant files in the repo map. */
+function repoHints(prompt: string, spec: Spec | null): string[] {
+  const words = new Set<string>();
+  const add = (s?: string) => {
+    if (s) for (const w of s.match(/[A-Za-z_][\w-]{2,}/g) || []) words.add(w);
+  };
+  add(prompt);
+  if (spec) {
+    add(spec.goal);
+    for (const f of spec.files) add(f);
+    for (const c of spec.acceptanceCriteria) add(c);
+  }
+  return [...words].slice(0, 60);
+}
+
 function flatten(nodes: ReturnType<typeof buildTree>, prefix = ''): string[] {
   const out: string[] = [];
   for (const n of nodes) {
@@ -394,5 +626,69 @@ function stripTags(s: string): string {
   return s.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '').trim();
 }
 
+export function getPlanProgress(projectPath: string): string {
+  const planPath = path.join(projectPath, 'PLAN.md');
+  if (!fs.existsSync(planPath)) {
+    return `\n\n[PLAN MONITOR] PLAN.md was not found. Please create PLAN.md with your task checklist (using - [ ] for tasks) to trace your progress.`;
+  }
+  try {
+    const content = fs.readFileSync(planPath, 'utf8');
+    const lines = content.split('\n');
+    const tasks: { status: string; text: string }[] = [];
+    for (const line of lines) {
+      const m = /^\s*-\s*\[([\s/xX])\]\s*(.*)$/.exec(line);
+      if (m) {
+        tasks.push({ status: m[1]!, text: m[2]!.trim() });
+      }
+    }
+    if (tasks.length === 0) {
+      return `\n\n[PLAN MONITOR] No checklist tasks found in PLAN.md. Please populate it with task list items (e.g. - [ ] task title) to trace execution.`;
+    }
+    const completed = tasks.filter(t => t.status.toLowerCase() === 'x').length;
+    const inProgress = tasks.filter(t => t.status === '/').length;
+    const remaining = tasks.filter(t => t.status === ' ' || t.status === '/');
+    
+    let progressStr = `\n\n[PLAN MONITOR] Progress: ${completed}/${tasks.length} tasks completed.`;
+    if (inProgress > 0) {
+      progressStr += ` (${inProgress} in progress)`;
+    }
+    progressStr += `\nRemaining tasks:\n`;
+    remaining.slice(0, 5).forEach(t => {
+      const prefix = t.status === '/' ? '  - [/] ' : '  - [ ] ';
+      progressStr += prefix + t.text + '\n';
+    });
+    if (remaining.length > 5) {
+      progressStr += `  - ... and ${remaining.length - 5} more\n`;
+    }
+    return progressStr.trimEnd();
+  } catch {
+    return '';
+  }
+}
+
+/** Seed PLAN.md from the approved plan when the project has none yet (or it is empty). */
+function seedPlanFile(projectPath: string, spec: Spec): void {
+  try {
+    const planPath = path.join(projectPath, 'PLAN.md');
+    const exists = fs.existsSync(planPath);
+    const empty = exists ? fs.readFileSync(planPath, 'utf8').trim().length === 0 : true;
+    if ((!exists || empty) && ((spec.plan && spec.plan.length) || spec.acceptanceCriteria.length)) {
+      fs.writeFileSync(planPath, specToPlanFile(spec), 'utf8');
+    }
+  } catch {
+    /* non-fatal: the agent will create PLAN.md itself */
+  }
+}
+
+/** Write a short CODDESS_STATUS.md when a run stops without finishing. Best-effort. */
+function writeStatusFileSafe(projectPath: string, note: string): void {
+  try {
+    fs.writeFileSync(path.join(projectPath, 'CODDESS_STATUS.md'), `# Coddess status\n\n${note}\n`, 'utf8');
+  } catch {
+    /* non-fatal */
+  }
+}
+
 export { countTokens };
 export type { ChatPaths };
+

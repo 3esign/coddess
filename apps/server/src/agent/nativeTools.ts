@@ -1,6 +1,7 @@
 import type { ChatMessage } from './provider/providerRouter.js';
 import { ProviderError } from './provider/providerRouter.js';
 import { getSettings } from '../settings.js';
+import { isFrontierModel } from './modelProfile.js';
 
 /**
  * Native (structured) tool-calling for providers that support it — a more
@@ -56,8 +57,8 @@ export function toAnthropicTools(): unknown[] {
 
 /** Whether the model's provider supports native tool-calling (everything except local Ollama). */
 export function providerSupportsNativeTools(model: string): boolean {
-  const id = (model || '').toLowerCase();
-  return /^(openrouter\/|anthropic\/|claude-|gemini\/|gemini-|deepseek\/|deepseek-|kimi\/|moonshot-|custom\/)/.test(id);
+  // Single source of truth shared with the tier classifier so the two never drift.
+  return isFrontierModel(model);
 }
 
 /** Parse an OpenAI-format chat completion into text + first tool call. Exposed for tests. */

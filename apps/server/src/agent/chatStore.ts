@@ -53,6 +53,11 @@ export function readMessages(p: ChatPaths): ChatMessage[] {
   return readJson<ChatMessage[]>(p.chatFile, []);
 }
 
+export function readHistory(p: ChatPaths): NormalizedEntry[] {
+  return readJson<NormalizedEntry[]>(p.historyFile, []);
+}
+
+
 export function writeMessages(p: ChatPaths, messages: ChatMessage[]): void {
   try {
     fs.writeFileSync(p.chatFile, JSON.stringify(messages, null, 2), 'utf8');

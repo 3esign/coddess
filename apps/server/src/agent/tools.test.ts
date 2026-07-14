@@ -102,3 +102,15 @@ test('read tools reach a linked context folder; writes cannot escape', async () 
   const w = await runTool(root, 'write_file', { path: path.join(ctx, 'x.txt'), content: 'no' }, [ctx]);
   assert.equal(w.ok, false);
 });
+
+test('edit_file falls back to an indentation-tolerant match', async () => {
+  const root = tmpProject();
+  await runTool(root, 'write_file', { path: 'e.ts', content: '  const x = 1\n  const y = 2\n' });
+  // The model supplies the block without the file's leading indentation — exact match misses.
+  const res = await runTool(root, 'edit_file', { path: 'e.ts', old: 'const x = 1\nconst y = 2', new: 'const z = 3' });
+  assert.equal(res.ok, true);
+  assert.match(res.output, /whitespace-tolerant/);
+  const after = fs.readFileSync(path.join(root, 'e.ts'), 'utf8');
+  assert.match(after, /const z = 3/);
+  assert.doesNotMatch(after, /const x = 1/);
+});

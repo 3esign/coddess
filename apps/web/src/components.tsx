@@ -89,9 +89,13 @@ function LogEntry({ e }: { e: NormalizedEntry }) {
       const s = e.spec;
       return (
         <div className="ev spec">
-          <div className="k" style={{ color: 'var(--accent)', fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: '0.5px', fontSize: '11px', display: 'flex', alignItems: 'center', gap: 8 }}>
-            🧭 understood intent
-            <span style={{ background: 'var(--accent)', color: '#0d1117', padding: '2px 6px', borderRadius: 4, fontSize: 9 }}>{s.label}</span>
+          <div className="k" style={{ color: '#4da6ff', fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: '0.8px', fontSize: '11px', display: 'flex', alignItems: 'center', gap: 8, paddingBottom: '4px', borderBottom: '1px solid #1f3a57' }}>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '-2px' }}>
+              <path d="M22 11.08V12a10 10 10 0 1 1-5.93-9.14"></path>
+              <polyline points="22 4 12 14.01 9 11.01"></polyline>
+            </svg>
+            SPECIFICATION
+            <span style={{ background: 'rgba(77, 166, 255, 0.15)', color: '#4da6ff', padding: '2px 8px', borderRadius: '12px', fontSize: '9px', marginLeft: 'auto' }}>{s.label}</span>
           </div>
           {s.goal && <div className="body" style={{ marginTop: 6 }}><strong>Goal:</strong> {s.goal}</div>}
           {s.stack && <div className="body small" style={{ marginTop: 4, color: 'var(--muted)' }}><strong>Stack:</strong> {s.stack}</div>}
@@ -189,6 +193,20 @@ function LogEntry({ e }: { e: NormalizedEntry }) {
           <div className="k" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
             <span style={{ fontSize: '9px', opacity: 0.6 }}>{expanded ? '▼' : '▶'}</span>{' '}
             {e.ok ? '✅ verification passed' : `🔁 verification failed — repairing (round ${e.round})`}: <strong style={{ color: 'var(--text)', marginLeft: 4 }}>{e.command}</strong>
+          </div>
+          {expanded && (
+            <div className="body mono" style={{ marginTop: 6 }}>
+              <pre style={{ margin: 0, padding: 8, background: 'rgba(0,0,0,0.25)', borderRadius: 6, border: '1px solid var(--border)', fontSize: 11, overflowX: 'auto', whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>{clip(e.output, 8000)}</pre>
+            </div>
+          )}
+        </div>
+      );
+    case 'review':
+      return (
+        <div className={`ev verify ${e.ok ? 'ok' : 'bad'}`} onClick={() => setExpanded(!expanded)} style={{ cursor: 'pointer' }}>
+          <div className="k" style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+            <span style={{ fontSize: '9px', opacity: 0.6 }}>{expanded ? '▼' : '▶'}</span>{' '}
+            {e.ok ? `✅ acceptance review passed (${e.met}/${e.total})` : `🔁 acceptance review — ${e.met}/${e.total} met, repairing (round ${e.round})`}
           </div>
           {expanded && (
             <div className="body mono" style={{ marginTop: 6 }}>

@@ -307,7 +307,7 @@ button { font-family: inherit; cursor: pointer; }
 .ev.verify.bad { border-left: 3px solid var(--amber); }
 
 /* ---- Composer one-row controls ---- */
-.composer-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.composer-row { display: flex; align-items: center; gap: 12px; flex-wrap: nowrap; overflow-x: auto; }
 .cbudget { display: flex; align-items: center; gap: 6px; }
 .cbudget input[type=range] { width: 74px; accent-color: var(--accent); }
 .cb-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .5px; }

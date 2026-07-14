@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFile, execSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import { ALLOW_SHELL } from '../config.js';
 
 /**
@@ -23,6 +23,35 @@ export interface VerifyResult {
 const OVERRIDE_FILE = '.coddess/verify.cmd';
 const VERIFY_TIMEOUT_MS = 180_000;
 const MAX_OUTPUT = 8000;
+
+/** `node --check <file>` as an async, timed call — never blocks the event loop. */
+function nodeSyntaxCheck(target: string): Promise<{ ok: boolean; error: string }> {
+  return new Promise((resolve) => {
+    execFile(process.execPath, ['--check', target], { timeout: 10_000, windowsHide: true }, (error, _stdout, stderr) => {
+      if (error) resolve({ ok: false, error: stderr?.toString() || (error as Error).message || String(error) });
+      else resolve({ ok: true, error: '' });
+    });
+  });
+}
+
+/**
+ * Race a promise against a timeout so a stuck async op (e.g. a Chromium launch
+ * that never returns) can't wedge a run forever. If the promise resolves after
+ * the timeout, best-effort close the value so a late browser doesn't leak.
+ */
+function withTimeout<T>(p: Promise<T>, ms: number, msg: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => { if (!settled) { settled = true; reject(new Error(msg)); } }, ms);
+    p.then(
+      (v) => {
+        if (!settled) { settled = true; clearTimeout(timer); resolve(v); }
+        else { try { (v as any)?.close?.(); } catch { /* ignore */ } }
+      },
+      (e) => { if (!settled) { settled = true; clearTimeout(timer); reject(e); } },
+    );
+  });
+}
 
 /** Pick a verification command, or null if the project has no obvious one. */
 export function detectVerifyCommand(root: string): string | null {
@@ -63,8 +92,59 @@ function firstHtml(root: string): string | null {
   }
 }
 
+async function checkBrowserErrors(htmlPath: string): Promise<{ ok: boolean; errors: string[]; note?: string }> {
+  let puppeteer: any;
+  try {
+    const pkgName = 'puppeteer';
+    puppeteer = (await import(pkgName)).default;
+  } catch {
+    return { ok: true, errors: [], note: 'Puppeteer not installed — skipped runtime browser checks.' };
+  }
+
+  let browser: any;
+  try {
+    browser = await withTimeout(puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-web-security',
+        '--use-gl=angle',
+        '--enable-webgl',
+        '--ignore-gpu-blocklist'
+      ]
+    }), 20_000, 'Puppeteer launch timed out after 20s');
+    const page = await browser.newPage();
+    const errors: string[] = [];
+    page.on('pageerror', (err: any) => {
+      errors.push(err.toString());
+    });
+    page.on('error', (err: any) => {
+      errors.push(err.toString());
+    });
+
+    const fileUrl = `file://${htmlPath.replace(/\\/g, '/')}`;
+    await page.goto(fileUrl, { waitUntil: 'load', timeout: 8000 });
+
+    // Wait 2 seconds for scripts to boot and run
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+
+    await browser.close();
+    return { ok: errors.length === 0, errors };
+  } catch (err) {
+    if (browser) {
+      try {
+        await browser.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    return { ok: false, errors: [`Browser runtime check error: ${(err as Error).message}`] };
+  }
+}
+
 /** Static check for no-build projects: entry HTML exists and its local refs resolve. */
-export function staticCheck(root: string): VerifyResult {
+export async function staticCheck(root: string): Promise<VerifyResult> {
   const htmlPath = firstHtml(root);
   if (!htmlPath) {
     return { ran: false, ok: true, command: '(static check)', output: 'No build step and no HTML entry point — nothing to auto-verify.' };
@@ -97,7 +177,9 @@ export function staticCheck(root: string): VerifyResult {
     };
   }
 
-  // Dry-run JS syntax check on local JS references
+  // Dry-run JS syntax check on local JS references. Uses async execFile with a
+  // timeout (never execSync) so a slow/stuck `node --check` cannot block the
+  // single server event loop — which would freeze REST + WebSocket together.
   const jsRefs = refs.filter((r) => r.toLowerCase().endsWith('.js'));
   const syntaxErrors: string[] = [];
   for (const ref of jsRefs) {
@@ -105,12 +187,8 @@ export function staticCheck(root: string): VerifyResult {
     if (!clean) continue;
     const target = path.resolve(dir, clean.replace(/^\//, ''));
     if (fs.existsSync(target)) {
-      try {
-        execSync(`node --check "${target}"`, { stdio: 'pipe' });
-      } catch (err: any) {
-        const errMsg = err.stderr?.toString() || err.message || String(err);
-        syntaxErrors.push(`- ${ref}:\n${errMsg.trim()}`);
-      }
+      const check = await nodeSyntaxCheck(target);
+      if (!check.ok) syntaxErrors.push(`- ${ref}:\n${check.error.trim()}`);
     }
   }
 
@@ -123,7 +201,24 @@ export function staticCheck(root: string): VerifyResult {
     };
   }
 
-  return { ran: true, ok: true, command: `static check (${rel})`, output: `${rel} OK — ${refs.length} local reference(s) resolve and verify successfully.` };
+  // Runtime browser check for unhandled exceptions
+  const browserCheck = await checkBrowserErrors(htmlPath);
+  if (!browserCheck.ok) {
+    return {
+      ran: true,
+      ok: false,
+      command: `static check (${rel})`,
+      output: `Runtime browser console errors detected in ${rel}:\n${browserCheck.errors.map((e) => `  - ${e}`).join('\n')}\nFix these runtime crashes.`,
+    };
+  }
+
+  const note = browserCheck.note ? `\nNote: ${browserCheck.note}` : '';
+  return {
+    ran: true,
+    ok: true,
+    command: `static check (${rel})`,
+    output: `${rel} OK — ${refs.length} local reference(s) resolve and verify successfully.${note}`,
+  };
 }
 
 function execVerify(root: string, command: string): Promise<VerifyResult> {
@@ -157,5 +252,5 @@ export async function runVerification(root: string): Promise<VerifyResult> {
     }
     return execVerify(root, command);
   }
-  return staticCheck(root);
+  return await staticCheck(root);
 }

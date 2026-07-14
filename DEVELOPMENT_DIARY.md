@@ -135,3 +135,52 @@ A chronological record of design decisions, implementation steps, and feature ad
 ## 2026-07-14 05:37:00 UTC | Antigravity (AI Agent)
 - **Action**: Interaction Sign-in
 - **Details**: Polished the project with standard community templates (LICENSE, Code of Conduct, Contributing guidelines, GitHub issue/PR templates, Actions CI workflow), generated a custom futuristic banner, overhauled the README, initialized Git, excluded the heavy local Tests directory, and published to GitHub at https://github.com/3esign/coddess.
+
+## 2026-07-14 | Bugfix: New Chat button + stalled-run watchdog
+- **New Chat did nothing**: `createNewChat` gated the whole creation on `window.prompt()`, which returns `null` in the desktop wrapper — so the chat was never created. Replaced with immediate creation using an auto title ("New Chat N"), and added inline double-click-to-rename (no `window.prompt`) backed by a new `PATCH /api/projects/:id/chats/:chatId` endpoint (+ `api.renameChat`). apps/web/src/App.tsx, apps/web/src/api.ts, apps/server/src/index.ts.
+- **Runs stalling with the UI stuck "running"**: a silent provider stream (typically Ollama context overflow / overloaded local model at high token counts) left the run hung with no terminal event, so the UI never left the running state and Stop looked inert. Added a stall watchdog in loop.ts: an internal AbortController is handed to the provider (external Stop is forwarded to it) and is aborted if no token arrives for `CODDESS_STREAM_IDLE_MS` (default 120s). On stall the run ends with a clear error status, so the UI unsticks on its own and Stop reliably interrupts even a hung stream. Also added a consecutive empty/no-action breaker (`CODDESS_MAX_EMPTY_RESPONSES`, default 4) so a context-blown model stops instead of spinning the step budget. apps/server/src/config.ts, apps/server/src/agent/loop.ts.
+- **Verified**: manual review against source of truth; watchdog abort/stall mechanism proven with a self-contained simulation (stall→error, Stop→cancelled). NOT typechecked in-sandbox (the Linux FUSE mount serves truncated copies — parse errors there are artifacts, not real). Owner must run `npm run typecheck && npm test` on the Windows host and restart `npm run dev` to load the fixes.
+
+## 2026-07-14 20:55:00 UTC | Antigravity (AI Agent)
+- **Action**: Interaction Sign-in
+- **Details**: Signed in to verify the user's fixes for (1) "New Chat" button returning null in the desktop wrapper and (2) Runs stalling at high token counts with a stream idle watchdog and consecutive empty-response breaker. Ran the full test suite (74 tests passing) and typechecked both `@coddess/server` and `@coddess/web` cleanly on the Windows host. Ready to assist with the next intelligence upgrades or core features.
+
+## 2026-07-14 21:15:00 UTC | Antigravity (AI Agent)
+- **Action**: Mid-Run Injection Queue & Interrupt Bugfix
+- **Details**: Fixed the issue where user-queued instructions during an active run did not appear in the UI logs and could not break a stuck model loop. Modified the WebSocket `inject` message handler (`ws.ts`) to immediately look up the active run and delegate to it. Expanded `RunHandle` and the core ReAct loop (`loop.ts`) to:
+  1. Immediately broadcast the `user_prompt` event and write to the chat's persistent history on injection, providing instant UI feedback.
+  2. Maintain a step-level `AbortController` reference and trigger a surgical abort of the active streaming turn when an injection is received.
+  3. Gracefully handle the step abort error via a new `interruptedByInjection` flag, saving any partial reasoning/token outputs and continuing immediately to the next step, where the injection queue is drained and processed by the model.
+- **Verified**: Confirmed typecheck clean and all 74 unit tests pass successfully.
+
+## 2026-07-14 21:27:00 UTC | Antigravity (AI Agent)
+- **Action**: Unified Build Composer with Autonomous Orchestrator (Auto-build)
+- **Details**: Merged the orchestrator execution model directly into the main Build tab workflow and removed the separate Auto-build tab from the UI.
+  1. Removed the tabbar and the OrchestratePanel from the React UI (`App.tsx`). The interface is now unified under the main Build activity log.
+  2. Modified the composer's "Run" submit handler to trigger a WebSocket `'orchestrate'` message instead of `'run'`, making multi-step decomposition and task execution the default behavior for prompts.
+  3. Upgraded `orchestrator.ts` to accept user-defined token budgets (`maxTokens`, `projectMaxTokens`) from the WebSocket payload and enforce them on subtask executions.
+  4. Configured the orchestrator to persist all planning, task execution progress, and done events to the chat's history file (`appendHistory`), ensuring that the orchestration overview card and step checklist survive page refreshes.
+  5. Hardened the WebSocket server (`ws.ts`) so that `cancel` and `pause` payloads (which contain subtask runIds) correctly resolve and cancel the root orchestrator's run handle.
+- **Verified**: Confirmed typecheck clean and all 74 unit tests pass successfully.
+
+## 2026-07-14 23:28:34 UTC | Bugfix: whole-app freeze / stuck on "connecting" (server crash-death + no client recovery)
+- **Symptom (owner-reported)**: after some time the agent "just stops" — no new chats can be opened, the New Chat button is unresponsive, queued messages don't work, and on reload the app only says "connecting…" with the project list empty.
+- **Root cause — it was a whole-app outage, not an agent bug.** The one Node process serves BOTH the REST API (projects/chats/settings) and the WebSocket run stream, and two independent defects combined:
+  - **(A) Server dies as a unit and stays dead.** There was NO `process.on('unhandledRejection' | 'uncaughtException')` guard, so a single unhandled rejection anywhere in the async agent pipeline (a provider stream error, a fire-and-forget critique/knowledge call, a socket closing mid-send, a Puppeteer launch failure) terminated the entire process — Node's default. Because `tsx watch` only restarts on FILE CHANGES, not on crashes, the outage was permanent: `GET /api/projects` fails (list empties), `/api/health` fails (the sidebar shows "connecting…"), New Chat (a REST POST) hangs/fails, and the WS can't connect.
+  - **(B) The client never recovers.** `ProjectView` opened the WebSocket once with no `onclose`/`onerror`/reconnect, and `send()` silently no-op'd whenever the socket wasn't OPEN — so runs, queued injects, Stop and Pause were dropped after any drop. Worse, `health` + `projects` were fetched ONCE on mount with no retry, so the UI stayed on "connecting…" with an empty list forever even after the server came back.
+  - **Secondary aggravators** in the auto-verify path that runs on every `<final>`: a synchronous `execSync('node --check')` (blocks the single event loop → freezes REST + WS together) and an un-timed `puppeteer.launch()` (can hang a run or leak Chromium processes over time — the "after some time" degradation).
+- **Fixes**:
+  - `apps/server/src/index.ts` — global `unhandledRejection` / `uncaughtException` handlers that log and keep serving instead of killing the process. This is the real safety net.
+  - `apps/server/src/ws.ts` — 30s ping/pong heartbeat that terminates half-open/dead sockets (laptop sleep, dropped Wi-Fi, killed tab), and a `try/catch` around every `socket.send` in `broadcast` so one dead client can never throw up into the run loop. `Client` now tracks `isAlive`; heartbeat cleared on `wss` close.
+  - `apps/server/src/agent/verify.ts` — replaced the blocking `execSync('node --check')` with an async, timed `execFile` (`nodeSyntaxCheck`, 10s) so JS syntax checks can't block the event loop; wrapped `puppeteer.launch()` in a 20s `withTimeout` race (best-effort closes a late-resolving browser) so a stuck Chromium can't wedge a run.
+  - `apps/web/src/App.tsx` — auto-reconnecting WebSocket (2s→15s backoff, re-subscribe on open, capped outbox flushed on reconnect so a click during a brief disconnect isn't lost) and a self-healing 4s health poll that reloads projects + settings the moment the server is reachable again. Added a "reconnecting…" indicator in the Activity log header so the connection state is visible instead of guessed.
+- **To test (on the Windows host)**:
+  1. `npm run typecheck && npm test` — expect clean + all tests green (the FUSE mount caveat below means in-sandbox checks are unreliable, not the code).
+  2. `npm run dev`, open the app, add/select a project, start a run.
+  3. Reconnect: stop the server (Ctrl-C the `dev:server`) mid-run → the header shows "reconnecting…" and projects reload on their own once you restart it; buttons and queued messages work again without a page reload.
+  4. Crash-survival: force an error path (e.g., run a provider with no API key, or a bad model) → the run reports an error but the server stays up (New Chat + project list keep working). Watch the server console for `[coddess] Unhandled … (kept alive)` instead of the process exiting.
+- **Verified**: manual review against the source of truth (Windows file tools). NOT typechecked in-sandbox — the Linux FUSE mount again served a TRUNCATED copy of `verify.ts` (the `nodeSyntaxCheck` call past line ~180 wasn't visible to bash), so any parse errors there are mount artifacts, not real. Owner must run `npm run typecheck && npm test` on the Windows host and restart `npm run dev` to load the fixes.
+- **Follow-up (optional)**: `tsx watch` still won't auto-restart on a hard crash — the crash guards now prevent that path, but a supervisor (nodemon / pm2) would add belt-and-suspenders resilience.
+
+
+

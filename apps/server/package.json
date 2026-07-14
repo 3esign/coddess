@@ -10,11 +10,12 @@
     "test": "tsx --test src/*.test.ts src/**/*.test.ts"
   },
   "dependencies": {
+    "@coddess/shared": "*",
     "@fastify/cors": "^10.0.1",
     "@fastify/static": "^8.0.3",
-    "@coddess/shared": "*",
     "fastify": "^5.1.0",
     "nanoid": "^5.0.9",
+    "puppeteer": "^25.3.0",
     "ws": "^8.18.0"
   },
   "devDependencies": {

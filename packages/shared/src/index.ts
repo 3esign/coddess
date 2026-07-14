@@ -17,9 +17,20 @@ export type RunStatus = 'idle' | 'running' | 'done' | 'error' | 'cancelled' | 'p
 /** Task classification, chosen automatically by the intent compiler. */
 export type TaskLabel = 'Feature' | 'Bug Fix' | 'Refactor' | 'Optimization' | 'Research' | 'Chore';
 
+/** One ordered implementation step (pipeline Stage 1 — plan development). */
+export interface PlanStep {
+  /** Short imperative step, e.g. "Scaffold the Express server and health route". */
+  title: string;
+  /** What to do and the key decisions/edge cases for this step. */
+  detail?: string;
+  /** How this step is confirmed working (a command, or an observable check). */
+  verify?: string;
+}
+
 /**
- * Structured specification produced by the intent compiler (pipeline Stage 0).
- * The build loop is anchored to this; acceptance criteria define "done".
+ * Structured specification produced by the intent compiler (pipeline Stage 0)
+ * plus an ordered build plan (Stage 1). The build loop is anchored to this;
+ * acceptance criteria define "done" and the plan is the route to get there.
  */
 export interface Spec {
   goal: string;
@@ -29,6 +40,8 @@ export interface Spec {
   files: string[];
   acceptanceCriteria: string[];
   openQuestions: string[];
+  /** Ordered steps that build the solution; each ideally names a verification. */
+  plan?: PlanStep[];
 }
 
 /**
@@ -47,6 +60,7 @@ export type NormalizedEntry = (
   | { kind: 'tool_use'; runId: string; projectId: string; ts: number; tool: string; args: Record<string, string> }
   | { kind: 'tool_result'; runId: string; projectId: string; ts: number; tool: string; ok: boolean; output: string }
   | { kind: 'verify'; runId: string; projectId: string; ts: number; command: string; ok: boolean; output: string; round: number }
+  | { kind: 'review'; runId: string; projectId: string; ts: number; ok: boolean; met: number; total: number; output: string; round: number }
   | { kind: 'final'; runId: string; projectId: string; ts: number; summary: string }
   | { kind: 'error'; runId: string; projectId: string; ts: number; message: string }
   | { kind: 'coddess_opinion'; runId: string; projectId: string; ts: number; text: string }
@@ -55,7 +69,7 @@ export type NormalizedEntry = (
 export type ClientMessage =
   | { type: 'subscribe'; projectId: string }
   | { type: 'run'; projectId: string; prompt: string; model?: string; chatId?: string; maxTokens?: number; projectMaxTokens?: number }
-  | { type: 'orchestrate'; projectId: string; goal: string; model?: string; chatId?: string }
+  | { type: 'orchestrate'; projectId: string; goal: string; model?: string; chatId?: string; maxTokens?: number; projectMaxTokens?: number }
   | { type: 'inject'; projectId: string; chatId?: string; text: string }
   | { type: 'cancel'; projectId: string; runId: string }
   | { type: 'pause'; projectId: string; runId: string };

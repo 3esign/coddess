@@ -2,6 +2,7 @@ import type { NormalizedEntry } from '@coddess/shared';
 import type { ChatMessage } from './provider/providerRouter.js';
 import { chatStream } from './provider/providerRouter.js';
 import { countTokens } from './budget.js';
+import { ENABLE_MASKING } from '../config.js';
 
 /**
  * Context compaction (pipeline cross-cutting component). Long tasks accumulate a
@@ -50,6 +51,16 @@ export function assembleCompacted(system: ChatMessage | null, summaryText: strin
   return out;
 }
 
+export function maskObservations(content: string): string {
+  return content.replace(/<observation([^>]*)>([\s\S]*?)<\/observation>/gi, (match, attrs, body) => {
+    const trimmedBody = body.trim();
+    if (trimmedBody.length > 100 && !trimmedBody.startsWith('[Output masked')) {
+      return `<observation${attrs}>\n[Output masked to save context (${trimmedBody.length} chars)]\n</observation>`;
+    }
+    return match;
+  });
+}
+
 const SUMMARY_SYSTEM = `You compact a software build conversation. Summarize the turns below into a terse, technical synopsis that a coding agent can rely on to continue the task without losing important state. Capture: decisions made, files created or changed and their purpose, commands run and their outcomes, unresolved problems, and what remains to do. No preamble, no fluff, no emojis. Output only the synopsis.`;
 
 /**
@@ -63,11 +74,54 @@ export async function compactIfNeeded(
   threshold: number,
   keepRecent: number,
   signal?: AbortSignal,
-): Promise<{ messages: ChatMessage[]; compacted: boolean; note?: NormalizedEntry }> {
+): Promise<{ messages: ChatMessage[]; compacted: boolean; noteText?: string; note?: NormalizedEntry }> {
   if (!needsCompaction(messages, threshold)) return { messages, compacted: false };
 
-  const { system, middle, recent } = splitForCompaction(messages, keepRecent);
-  if (middle.length === 0) return { messages, compacted: false };
+  let currentMessages = messages;
+  let masked = false;
+
+  if (ENABLE_MASKING) {
+    const { system, middle, recent } = splitForCompaction(messages, keepRecent);
+    if (middle.length > 0) {
+      let maskedAny = false;
+      const maskedMiddle = middle.map((m) => {
+        if (m.role === 'user') {
+          const maskedContent = maskObservations(m.content);
+          if (maskedContent !== m.content) {
+            maskedAny = true;
+            return { ...m, content: maskedContent };
+          }
+        }
+        return m;
+      });
+
+      if (maskedAny) {
+        const assembled: ChatMessage[] = [];
+        if (system) assembled.push(system);
+        assembled.push(...maskedMiddle);
+        assembled.push(...recent);
+        currentMessages = assembled;
+        masked = true;
+
+        if (!needsCompaction(currentMessages, threshold)) {
+          return {
+            messages: currentMessages,
+            compacted: true,
+            noteText: 'Context optimized: older tool outputs were masked to save context.',
+          };
+        }
+      }
+    }
+  }
+
+  const { system, middle, recent } = splitForCompaction(currentMessages, keepRecent);
+  if (middle.length === 0) {
+    return {
+      messages: currentMessages,
+      compacted: masked,
+      noteText: masked ? 'Context optimized: older tool outputs were masked to save context.' : undefined,
+    };
+  }
 
   const transcript = middle
     .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
@@ -87,9 +141,12 @@ export async function compactIfNeeded(
   }
 
   if (!summary.trim()) {
-    // Fallback: drop the oldest turns entirely (keep system + recent) with a marker.
     summary = `(Automatic summary unavailable. ${middle.length} earlier turns were dropped to fit the context window; rely on the current project files as the source of truth.)`;
   }
 
-  return { messages: assembleCompacted(system, summary.trim(), recent), compacted: true };
+  return {
+    messages: assembleCompacted(system, summary.trim(), recent),
+    compacted: true,
+    noteText: 'Context compacted: older turns were summarized to fit the model window.',
+  };
 }

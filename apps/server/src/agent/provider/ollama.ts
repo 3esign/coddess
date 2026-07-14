@@ -1,4 +1,4 @@
-import { OLLAMA_HOST } from '../../config.js';
+import { OLLAMA_HOST, NUM_CTX } from '../../config.js';
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
@@ -26,7 +26,7 @@ export async function* chatStream(
         model,
         messages,
         stream: true,
-        options: { temperature: 0.2 },
+        options: { temperature: 0.2, num_ctx: NUM_CTX },
       }),
       signal,
     });

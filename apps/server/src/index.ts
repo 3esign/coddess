@@ -13,6 +13,25 @@ import { getSettings, saveSettings } from './settings.js';
 import * as git from './git.js';
 import { listTasks, createTask, updateTask, deleteTask } from './tasksStore.js';
 
+/**
+ * Crash guards. This one process serves BOTH the REST API (projects, chats,
+ * settings) and the WebSocket run stream. Without these handlers, a single
+ * unhandled promise rejection or thrown error anywhere in the async agent
+ * pipeline (a provider stream error, a fire-and-forget critique/knowledge call,
+ * a socket that closes mid-send, a Puppeteer launch failure, ...) terminates
+ * the entire Node process — Node's default for an unhandled rejection. That
+ * took the whole app down at once: the UI shows "connecting…", the project list
+ * comes back empty, "New Chat" does nothing, and queued messages are dropped.
+ * `tsx watch` only restarts on FILE CHANGES, not on crashes, so the outage was
+ * permanent until a manual restart. Log and keep serving instead of dying.
+ */
+process.on('unhandledRejection', (reason) => {
+  console.error('[coddess] Unhandled promise rejection (kept alive):', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('[coddess] Uncaught exception (kept alive):', err);
+});
+
 const app = Fastify({ logger: false });
 await app.register(cors, { origin: true });
 
@@ -241,6 +260,27 @@ app.post('/api/projects/:id/chats', async (req, reply) => {
   fs.writeFileSync(path.join(chatsDir, `${chatId}_messages.json`), '[]', 'utf8');
   fs.writeFileSync(path.join(chatsDir, `${chatId}_history.json`), '[]', 'utf8');
   return { chat: newChat };
+});
+
+app.patch('/api/projects/:id/chats/:chatId', async (req, reply) => {
+  const { id, chatId } = req.params as { id: string; chatId: string };
+  const body = req.body as { title?: string };
+  const p = getProject(id);
+  if (!p) return reply.code(404).send({ error: 'Project not found' });
+  const title = body?.title?.trim();
+  if (!title) return reply.code(400).send({ error: 'title is required' });
+  const metadataFile = path.join(p.path, '.coddess', 'chats', 'metadata.json');
+  if (!fs.existsSync(metadataFile)) return reply.code(404).send({ error: 'Chat not found' });
+  try {
+    const meta: any[] = JSON.parse(fs.readFileSync(metadataFile, 'utf8'));
+    const idx = meta.findIndex((c) => c.id === chatId);
+    if (idx === -1) return reply.code(404).send({ error: 'Chat not found' });
+    meta[idx] = { ...meta[idx], title };
+    fs.writeFileSync(metadataFile, JSON.stringify(meta, null, 2), 'utf8');
+    return { chat: meta[idx] };
+  } catch (err) {
+    return reply.code(500).send({ error: (err as Error).message });
+  }
 });
 
 app.delete('/api/projects/:id/chats/:chatId', async (req, reply) => {

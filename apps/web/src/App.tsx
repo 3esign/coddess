@@ -59,10 +59,35 @@ export function App() {
     }
   }, []);
 
+  // Poll the server instead of loading once. The old one-shot load meant that
+  // if the server was down/restarting at mount (or crashed later), the UI was
+  // stuck on "connecting…" with an empty project list forever, with no retry.
+  // Now we re-check every few seconds and, the moment the server is reachable
+  // again, reload projects + settings so the app self-heals on its own.
+  const wasHealthyRef = useRef(false);
   useEffect(() => {
-    refreshHealth();
+    let cancelled = false;
+    const ping = async () => {
+      try {
+        const h = await api.health();
+        if (cancelled) return;
+        setHealth(h);
+        api.getSettings().then((s) => { if (!cancelled) setSettings(s); }).catch(() => {});
+        if (!wasHealthyRef.current) {
+          wasHealthyRef.current = true;
+          refreshProjects();
+        }
+      } catch {
+        if (cancelled) return;
+        setHealth(null);
+        wasHealthyRef.current = false;
+      }
+    };
+    ping();
     refreshProjects();
-  }, [refreshHealth, refreshProjects]);
+    const t = setInterval(ping, 4000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [refreshProjects]);
 
   useEffect(() => {
     if (selectedId) {
@@ -77,14 +102,28 @@ export function App() {
   const selected = projects.find((p) => p.id === selectedId) ?? null;
 
   async function createNewChat(projectId: string) {
-    const title = window.prompt('Enter a title for the new chat:', 'New Chat');
-    if (title === null) return;
+    // Create immediately with an auto title. (We intentionally do NOT use
+    // window.prompt here: in the desktop wrapper it returns null, which silently
+    // dropped the new chat — the "New Chat does nothing" bug. Rename is inline.)
     try {
+      const existing = chats.filter((c) => c.id !== 'default').length;
+      const title = `New Chat ${existing + 1}`;
       const newChat = await api.createChat(projectId, title, selected?.model);
       await refreshChats(projectId);
       setCurrentChatId(newChat.id);
     } catch (e: any) {
       alert('Failed to create chat: ' + e.message);
+    }
+  }
+
+  async function renameChat(projectId: string, chatId: string, title: string) {
+    const clean = title.trim();
+    if (!clean) return;
+    try {
+      await api.renameChat(projectId, chatId, clean);
+      await refreshChats(projectId);
+    } catch (e: any) {
+      alert('Failed to rename chat: ' + e.message);
     }
   }
 
@@ -140,6 +179,7 @@ export function App() {
             onSelectChat={setCurrentChatId}
             onCreateChat={() => createNewChat(selectedId!)}
             onDeleteChat={(chatId) => deleteChat(selectedId!, chatId)}
+            onRenameChat={(chatId, title) => renameChat(selectedId!, chatId, title)}
             onRemoveProject={removeProject}
             onAddContext={addContext}
             onRemoveContext={removeContext}
@@ -179,7 +219,7 @@ export function App() {
 
 function Sidebar({
   width, onCollapse, health, projects, selectedId, onSelect, onChange, onOpenSettings,
-  chats, currentChatId, onSelectChat, onCreateChat, onDeleteChat, onRemoveProject, onAddContext, onRemoveContext,
+  chats, currentChatId, onSelectChat, onCreateChat, onDeleteChat, onRenameChat, onRemoveProject, onAddContext, onRemoveContext,
 }: {
   width: number;
   onCollapse: () => void;
@@ -194,6 +234,7 @@ function Sidebar({
   onSelectChat: (id: string) => void;
   onCreateChat: () => void;
   onDeleteChat: (chatId: string) => void;
+  onRenameChat: (chatId: string, title: string) => void;
   onRemoveProject: (id: string) => void;
   onAddContext: (dir: string) => void;
   onRemoveContext: (dir: string) => void;
@@ -204,6 +245,8 @@ function Sidebar({
   const [err, setErr] = useState('');
   const [isExplorerOpen, setIsExplorerOpen] = useState(false);
   const [chatsCollapsed, setChatsCollapsed] = useState(false);
+  const [editingChatId, setEditingChatId] = useState<string | null>(null);
+  const [editTitle, setEditTitle] = useState('');
 
   async function add() {
     if (!path.trim()) return;
@@ -266,12 +309,31 @@ function Sidebar({
                   <div style={{ display: 'flex', flexDirection: 'column', gap: '3px' }}>
                     {chats.map((c) => (
                       <div key={c.id} style={{ padding: '4px 8px', borderRadius: '4px', fontSize: '11px', cursor: 'pointer', background: c.id === currentChatId ? 'var(--accent)' : 'transparent', color: c.id === currentChatId ? '#ffffff' : 'var(--muted)', display: 'flex', justifyContent: 'space-between', alignItems: 'center', transition: 'all 0.2s' }} onClick={(e) => { e.stopPropagation(); onSelectChat(c.id); }}>
-                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '150px', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                          {c.title}
-                          {c.status === 'running' && <span title="Running">•</span>}
-                          {c.status === 'paused' && <span title="Paused">‖</span>}
-                        </span>
-                        {c.id !== 'default' && (
+                        {editingChatId === c.id ? (
+                          <input
+                            autoFocus
+                            value={editTitle}
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={(e) => setEditTitle(e.target.value)}
+                            onBlur={() => { onRenameChat(c.id, editTitle); setEditingChatId(null); }}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') { e.preventDefault(); onRenameChat(c.id, editTitle); setEditingChatId(null); }
+                              if (e.key === 'Escape') setEditingChatId(null);
+                            }}
+                            style={{ flex: 1, fontSize: '11px', padding: '1px 4px', borderRadius: '3px', border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(0,0,0,0.3)', color: '#fff' }}
+                          />
+                        ) : (
+                          <span
+                            style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: '150px', display: 'flex', alignItems: 'center', gap: '4px' }}
+                            title={c.id !== 'default' ? 'Double-click to rename' : undefined}
+                            onDoubleClick={(e) => { if (c.id !== 'default') { e.stopPropagation(); setEditTitle(c.title); setEditingChatId(c.id); } }}
+                          >
+                            {c.title}
+                            {c.status === 'running' && <span title="Running">•</span>}
+                            {c.status === 'paused' && <span title="Paused">‖</span>}
+                          </span>
+                        )}
+                        {c.id !== 'default' && editingChatId !== c.id && (
                           <button className="mini danger" onClick={(e) => { e.stopPropagation(); onDeleteChat(c.id); }} style={{ padding: '0 4px', background: 'transparent', border: 'none', color: 'var(--red)', fontSize: '10px', opacity: 0.6 }} title="Delete Chat">✕</button>
                         )}
                       </div>
@@ -351,7 +413,7 @@ function ProjectView({
   const [chatBudgets, setChatBudgets] = useState<Record<string, { maxTokens: number; maxChatLimit: number }>>({});
   const [maxProjectLimit, setMaxProjectLimit] = useState(10000000);
   const [projectMaxTokens, setProjectMaxTokens] = useState(1000000);
-  const [tab, setTab] = useState<'build' | 'orchestrate'>('build');
+  const tab = 'build';
   const [editingMax, setEditingMax] = useState<'chat' | 'proj' | null>(null);
   const [justQueued, setJustQueued] = useState(false);
 
@@ -383,6 +445,8 @@ function ProjectView({
   useEffect(() => { runIdRef.current = runId; }, [runId]);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const outboxRef = useRef<ClientMessage[]>([]);
+  const [connected, setConnected] = useState(false);
   const logEndRef = useRef<HTMLDivElement | null>(null);
   const logScrollRef = useRef<HTMLDivElement | null>(null);
 
@@ -396,19 +460,67 @@ function ProjectView({
   const handleEventRef = useRef(handleEvent);
   useEffect(() => { handleEventRef.current = handleEvent; });
 
+  // Auto-reconnecting WebSocket. The old code opened the socket once and never
+  // recovered: after ANY drop (server restart, `tsx watch` reload, laptop
+  // sleep, a network blip) send() silently no-op'd forever, so runs, queued
+  // messages, Stop and Pause all stopped working until a full page reload —
+  // exactly the "buttons do nothing / queued messages don't work" symptom. Now
+  // we reconnect with backoff, re-subscribe on open, and flush a small outbox
+  // of anything the user did while briefly disconnected.
   useEffect(() => {
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const ws = new WebSocket(`${proto}://${location.host}/ws`);
-    wsRef.current = ws;
-    ws.onopen = () => send({ type: 'subscribe', projectId: project.id });
-    ws.onmessage = (m) => { const e = JSON.parse(m.data) as NormalizedEntry; handleEventRef.current(e); };
-    return () => ws.close();
+    let closedByUnmount = false;
+    let attempt = 0;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const flush = (ws: WebSocket) => {
+      const pending = outboxRef.current;
+      outboxRef.current = [];
+      for (const m of pending) {
+        try { ws.send(JSON.stringify(m)); } catch { outboxRef.current.push(m); }
+      }
+    };
+
+    const connect = () => {
+      if (closedByUnmount) return;
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      const ws = new WebSocket(`${proto}://${location.host}/ws`);
+      wsRef.current = ws;
+      ws.onopen = () => {
+        attempt = 0;
+        setConnected(true);
+        try { ws.send(JSON.stringify({ type: 'subscribe', projectId: project.id } as ClientMessage)); } catch { /* ignore */ }
+        flush(ws);
+      };
+      ws.onmessage = (m) => { const e = JSON.parse(m.data) as NormalizedEntry; handleEventRef.current(e); };
+      ws.onclose = () => {
+        setConnected(false);
+        if (closedByUnmount) return;
+        attempt += 1;
+        const delay = Math.min(1000 * 2 ** Math.min(attempt, 4), 15000); // 2s → 15s backoff
+        reconnectTimer = setTimeout(connect, delay);
+      };
+      ws.onerror = () => { try { ws.close(); } catch { /* onclose schedules the reconnect */ } };
+    };
+
+    connect();
+    return () => {
+      closedByUnmount = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      try { wsRef.current?.close(); } catch { /* ignore */ }
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project.id]);
 
   function send(msg: ClientMessage) {
     const ws = wsRef.current;
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.send(JSON.stringify(msg)); return; } catch { /* fall through to queue */ }
+    }
+    // Not open yet: queue it (capped) so a click during a brief reconnect isn't
+    // lost — onopen flushes the outbox once the socket is back.
+    const q = outboxRef.current;
+    q.push(msg);
+    if (q.length > 25) q.splice(0, q.length - 25);
   }
 
   const updateRunState = (chatId: string, patch: Partial<ChatRunState>) => {
@@ -467,29 +579,20 @@ function ProjectView({
   useEffect(() => { logEndRef.current?.scrollIntoView({ behavior: 'auto' }); }, [currentChatId]);
 
   useEffect(() => {
-    if (tab !== 'build') return;
     const id = requestAnimationFrame(() => logEndRef.current?.scrollIntoView({ behavior: 'auto' }));
     return () => cancelAnimationFrame(id);
-  }, [tab]);
+  }, []);
 
   function run() {
     if (!prompt.trim() || running) return;
     setViewer(null);
     updateRunState(currentChatId, { running: true, runId: null, liveText: '', currentRunTokens: 0, pausing: false, coddessLiveText: '' });
     send({
-      type: 'run', projectId: project.id, prompt: prompt.trim(), model: model || undefined, chatId: currentChatId,
+      type: 'orchestrate', projectId: project.id, goal: prompt.trim(), model: model || undefined, chatId: currentChatId,
       maxTokens: maxTokens === maxChatLimit ? undefined : maxTokens,
       projectMaxTokens: projectMaxTokens === maxProjectLimit ? undefined : projectMaxTokens,
     });
     setPrompt('');
-  }
-
-  function sendOrchestrate(goal: string) {
-    if (!goal.trim() || running) return;
-    setViewer(null);
-    setTab('build');
-    updateRunState(currentChatId, { running: true, runId: null, liveText: '', currentRunTokens: 0, pausing: false, coddessLiveText: '' });
-    send({ type: 'orchestrate', projectId: project.id, goal: goal.trim(), model: model || undefined, chatId: currentChatId });
   }
 
   function sendInject() {
@@ -610,17 +713,9 @@ function ProjectView({
         </div>
       </header>
 
-      <div className="tabbar">
-        <button className={`tabbtn ${tab === 'build' ? 'active' : ''}`} onClick={() => setTab('build')}>Build</button>
-        <button className={`tabbtn ${tab === 'orchestrate' ? 'active' : ''}`} onClick={() => setTab('orchestrate')}>Auto-build</button>
-      </div>
-
       <section className="middle">
-          {tab === 'orchestrate' ? (
-            <div className="orchpane"><OrchestratePanel projectId={project.id} running={running} onOrchestrate={sendOrchestrate} onCancel={cancel} /></div>
-          ) : (
             <div className="buildpane">
-              <div className="pane-title">Activity log {running && <span className="spinner" />}</div>
+              <div className="pane-title">Activity log {running && <span className="spinner" />}{!connected && <span className="muted small" style={{ marginLeft: 8, color: 'var(--red)' }}>· reconnecting…</span>}</div>
               <div ref={logScrollRef} className="logscroll">
                 <LogView events={events} />
                 {liveText && (
@@ -680,7 +775,7 @@ function ProjectView({
                     {running ? (
                       <>
                         {prompt.trim() && <button className="btn outline" onClick={sendInject} title="Queue this message for the running agent">Queue</button>}
-                        <button className="btn danger iconbtn" onClick={cancel} title="Stop">■</button>
+                        <button className="btn danger iconbtn" style={{ padding: '6px 12px', fontSize: '13px', fontWeight: 'bold' }} onClick={cancel} title="Stop">Stop</button>
                       </>
                     ) : (
                       <button className="btn primary" onClick={run} disabled={!prompt.trim()}>{activeChat?.status === 'paused' ? 'Continue' : 'Run'}</button>
@@ -689,10 +784,9 @@ function ProjectView({
                 </div>
               </div>
             </div>
-          )}
-      </section>
+        </section>
       </div>
-      {tab === 'build' && rightOpen && (
+      {rightOpen && (
           <>
             <div className="resizer col" onMouseDown={startFilesResize} title="Drag to resize" />
             <aside className="filespane" style={{ width: filesWidth }}>

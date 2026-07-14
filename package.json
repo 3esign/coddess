@@ -14,10 +14,12 @@
     "typecheck": "npm run typecheck -w @coddess/server && npm run typecheck -w @coddess/web",
     "test": "npm run test -w @coddess/server",
     "build:web": "npm run build -w @coddess/web",
+    "eval": "tsx evals/run.ts",
     "diary": "node scripts/diary.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.1.0",
+    "tsx": "^4.19.2",
     "typescript": "^5.6.3"
   },
   "engines": {

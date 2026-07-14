@@ -99,23 +99,101 @@ function writeFile(root: string, rel: string, content: string): ToolResult {
 
 /**
  * Surgical edit: replace an exact substring instead of rewriting the whole file.
- * Cheaper on tokens and produces cleaner diffs. Fails loudly if the target text
- * is not found, or is ambiguous (appears more than once) unless replace_all set.
+ * Cheaper on tokens and produces cleaner diffs. Tries an EXACT match first; if that
+ * misses (the #1 cause of failed edits on weaker models — a stray space or wrong
+ * indentation), it retries with a whitespace/indentation-tolerant line match before
+ * giving up. On a real miss it returns the closest near-match to guide the model.
  */
 function editFile(root: string, rel: string, oldStr: string, newStr: string, replaceAll: boolean): ToolResult {
   const abs = resolveInProject(root, rel);
   if (!fs.existsSync(abs)) return { ok: false, output: `File not found: ${rel}. Use write_file to create it.` };
   const original = fs.readFileSync(abs, 'utf8');
+
+  // 1. Exact match — fast path, unchanged semantics.
   const occurrences = original.split(oldStr).length - 1;
-  if (occurrences === 0) {
-    return { ok: false, output: `The 'old' text was not found in ${rel}. Read the file again and match it exactly (including whitespace).` };
-  }
   if (occurrences > 1 && !replaceAll) {
     return { ok: false, output: `The 'old' text appears ${occurrences} times in ${rel}. Add more surrounding context to make it unique, or set replace_all=true.` };
   }
-  const updated = replaceAll ? original.split(oldStr).join(newStr) : original.replace(oldStr, newStr);
-  fs.writeFileSync(abs, updated, 'utf8');
-  return { ok: true, output: `Edited ${rel} (${occurrences} replacement${occurrences === 1 ? '' : 's'}, now ${updated.split('\n').length} lines).` };
+  if (occurrences >= 1) {
+    const updated = replaceAll ? original.split(oldStr).join(newStr) : original.replace(oldStr, newStr);
+    fs.writeFileSync(abs, updated, 'utf8');
+    return { ok: true, output: `Edited ${rel} (${occurrences} replacement${occurrences === 1 ? '' : 's'}, now ${updated.split('\n').length} lines).` };
+  }
+
+  // 2. Forgiving fallback — match ignoring trailing whitespace, then indentation.
+  const fuzzy = fuzzyReplace(original, oldStr, newStr, replaceAll);
+  if (fuzzy.ok) {
+    fs.writeFileSync(abs, fuzzy.text!, 'utf8');
+    return { ok: true, output: `Edited ${rel} via whitespace-tolerant match (${fuzzy.count} replacement${fuzzy.count === 1 ? '' : 's'}, now ${fuzzy.text!.split('\n').length} lines).` };
+  }
+  const hint = fuzzy.hint ? `\nClosest near-match in the file:\n${fuzzy.hint}` : ' (even ignoring whitespace).';
+  return { ok: false, output: `The 'old' text was not found in ${rel}${hint}\nRe-read the file and copy the target exactly, or use write_file to rewrite the whole file.` };
+}
+
+interface FuzzyResult { ok: boolean; text?: string; count: number; hint?: string }
+
+/** Whitespace/indentation-tolerant line-block replacement used when the exact match fails. */
+function fuzzyReplace(original: string, oldStr: string, newStr: string, replaceAll: boolean): FuzzyResult {
+  const origLines = original.split('\n');
+  let oldLines = oldStr.replace(/\r\n/g, '\n').split('\n');
+  // Drop a single trailing blank line in the search block (models often add one).
+  if (oldLines.length > 1 && oldLines[oldLines.length - 1]!.trim() === '') oldLines = oldLines.slice(0, -1);
+  if (oldLines.length === 0) return { ok: false, count: 0 };
+
+  const stripTrail = (s: string) => s.replace(/[ \t\r]+$/, '');
+  const fullTrim = (s: string) => s.trim();
+
+  for (const normFn of [stripTrail, fullTrim]) {
+    const windows = findWindows(origLines, oldLines, normFn);
+    if (windows.length === 1 || (windows.length > 1 && replaceAll)) {
+      return { ok: true, text: spliceWindows(origLines, windows, oldLines.length, newStr, original.includes('\r\n')), count: windows.length };
+    }
+    if (windows.length > 1 && !replaceAll) {
+      return { ok: false, count: windows.length, hint: `the block appears ${windows.length} times (ignoring whitespace) — add more context or set replace_all=true` };
+    }
+  }
+  return { ok: false, count: 0, hint: bestNearMiss(origLines, oldLines) };
+}
+
+function findWindows(origLines: string[], oldLines: string[], normFn: (s: string) => string): number[] {
+  const n = oldLines.length;
+  const normOld = oldLines.map(normFn);
+  const out: number[] = [];
+  for (let i = 0; i + n <= origLines.length; i++) {
+    let ok = true;
+    for (let j = 0; j < n; j++) {
+      if (normFn(origLines[i + j]!) !== normOld[j]) { ok = false; break; }
+    }
+    if (ok) out.push(i);
+  }
+  return out;
+}
+
+function spliceWindows(origLines: string[], starts: number[], n: number, newStr: string, crlf: boolean): string {
+  let newLines = newStr.replace(/\r\n/g, '\n').split('\n');
+  if (crlf) newLines = newLines.map((l) => (l.endsWith('\r') ? l : l + '\r'));
+  const set = new Set(starts);
+  const out: string[] = [];
+  for (let i = 0; i < origLines.length; ) {
+    if (set.has(i)) { out.push(...newLines); i += n; } else { out.push(origLines[i]!); i++; }
+  }
+  return out.join('\n');
+}
+
+/** Best partially-matching window, shown to help the model correct its 'old' text. */
+function bestNearMiss(origLines: string[], oldLines: string[]): string | undefined {
+  const n = oldLines.length;
+  if (n === 0 || origLines.length < n) return undefined;
+  const normOld = oldLines.map((s) => s.trim());
+  let best = -1;
+  let bestScore = -1;
+  for (let i = 0; i + n <= origLines.length; i++) {
+    let score = 0;
+    for (let j = 0; j < n; j++) if (origLines[i + j]!.trim() === normOld[j]) score++;
+    if (score > bestScore) { bestScore = score; best = i; }
+  }
+  if (best < 0 || bestScore < Math.max(1, Math.ceil(n / 2))) return undefined;
+  return origLines.slice(best, best + n).join('\n').slice(0, 400);
 }
 
 const SEARCH_IGNORE = new Set(['node_modules', '.git', 'dist', 'build', '.data', '.next', '.cache', '.coddess']);
@@ -271,7 +349,17 @@ async function browserEval(root: string, relPath: string, jsEval: string): Promi
 
   let browser;
   try {
-    browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+    browser = await puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-web-security',
+        '--use-gl=angle',
+        '--enable-webgl',
+        '--ignore-gpu-blocklist'
+      ]
+    });
     const page = await browser.newPage();
 
     const consoleErrors: string[] = [];
